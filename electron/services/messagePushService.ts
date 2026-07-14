@@ -37,6 +37,26 @@ interface MessagePushPayload {
   groupName?: string
   content: string | null
   timestamp: number
+  /**
+   * 发送者的稳定账号 id（新消息＝发送者，撤回＝撤回者）。
+   *
+   * `sourceName` 是**显示名**：群昵称会被随时改掉，而且不同的人可以改成同一个名字。
+   * 任何用 `sourceName` 做身份归并的下游，早晚会把两个人认成一个。这个字段给的是
+   * 微信账号 id 本身 —— 注意它**不一定是 `wxid_` 前缀**：老号是自定义 id
+   * （如 `lyp45ms`、`qq562959733`）。不要用前缀做校验。
+   *
+   * 拿不到时为 `null`（系统消息、自己发的消息），而不是回落成某个名字。
+   */
+  sender: string | null
+  /**
+   * 消息的稳定平台 id（`serverIdRaw`），与 HTTP 拉取接口返回的 `platformMessageId`
+   * 是同一个值 —— 所以推送与拉取可以用它互相去重。
+   *
+   * 撤回事件里，**只有当原消息被真正定位到时才给值**，否则为 `null`。`rawid` 会为了
+   * 让人看懂而回落到「最近一条」的猜测甚至字符串「未知」；那种猜测放进给人看的文案里
+   * 无妨，但绝不能进 id 字段 —— 按猜出来的 id 去撤回一条消息，比不撤回更糟。
+   */
+  platformMessageId: string | null
 }
 
 const PUSH_CONFIG_KEYS = new Set([
@@ -714,6 +734,8 @@ class MessagePushService {
     const sessionType = this.getSessionType(sessionId, session)
     const content = this.getMessageDisplayContent(message)
     const rawid = this.getMessageRawId(message)
+    const sender = this.getSenderUsername(message)
+    const platformMessageId = this.getPlatformMessageId(message)
 
     const createTime = Number(message.createTime || 0)
 
@@ -731,7 +753,9 @@ class MessagePushService {
         groupName,
         sourceName,
         content,
-        timestamp: createTime
+        timestamp: createTime,
+        sender,
+        platformMessageId
       }
     }
 
@@ -745,8 +769,22 @@ class MessagePushService {
       avatarUrl,
       sourceName: session.displayName || contactInfo?.displayName || sessionId,
       content,
-      timestamp: createTime
+      timestamp: createTime,
+      sender,
+      platformMessageId
     }
+  }
+
+  /** 稳定账号 id。老号没有 `wxid_` 前缀，所以这里不做任何形态校验。 */
+  private getSenderUsername(message: Message): string | null {
+    const sender = String(message.senderUsername || '').trim()
+    return sender || null
+  }
+
+  /** 稳定消息 id；与 HTTP 拉取接口的 `platformMessageId` 同源。 */
+  private getPlatformMessageId(message: Message): string | null {
+    const id = String(message.serverIdRaw || '').trim()
+    return id || null
   }
 
   private isRevokeSystemMessage(message: Message): boolean {
@@ -1017,6 +1055,10 @@ class MessagePushService {
     const isGroup = sessionId.endsWith('@chatroom')
     const sessionType = this.getSessionType(sessionId, session)
     const createTime = Number(message.createTime || 0)
+    // `rawid` 为了让人看懂，会一路回落到 findNearestMessageBeforeRevoke 的**猜测**、
+    // 撤回系统行自己的 id、最后是字符串「未知」。那些回落对文案无害，但绝不能进 id
+    // 字段：只有 originalMessage 真的被定位到时，我们才知道被撤回的是哪一条。
+    const platformMessageId = originalMessage ? this.getPlatformMessageId(originalMessage) : null
 
     if (isGroup) {
       const groupInfo = await chatService.getContactAvatar(sessionId)
@@ -1034,7 +1076,10 @@ class MessagePushService {
         groupName,
         sourceName,
         content,
-        timestamp: createTime
+        timestamp: createTime,
+        // 撤回事件里的 sender 是**撤回者**，不是原消息的作者。
+        sender: this.getSenderUsername(sourceMessage),
+        platformMessageId
       }
     }
 
@@ -1048,7 +1093,9 @@ class MessagePushService {
       avatarUrl,
       sourceName: session.displayName || contactInfo?.displayName || sessionId,
       content,
-      timestamp: createTime
+      timestamp: createTime,
+      sender: this.getSenderUsername(message),
+      platformMessageId
     }
   }
 

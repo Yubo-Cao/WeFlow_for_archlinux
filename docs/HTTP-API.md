@@ -75,7 +75,7 @@ GET /api/v1/push/messages
 - 同时需要开启 `主动推送`
 - 响应类型为 `text/event-stream`
 - 事件名包含 `message.new` 和 `message.revoke`
-- 建议接收端按 `event + rawid` 去重
+- 建议接收端按 `event + platformMessageId` 去重（`platformMessageId` 为 `null` 时回落到 `event + rawid`）
 
 ### 事件字段
 
@@ -83,10 +83,14 @@ GET /api/v1/push/messages
 - `sessionId`
 - `rawid`
 - `avatarUrl`
-- `sourceName`
+- `sourceName` —— **显示名，不是身份**。群昵称可以随时改，而且两个人可以改成同一个名字。用它做身份归并早晚会把两个人认成一个；要身份请用下面的 `sender`。
 - `groupName`（仅群聊）
 - `content`
 - `timestamp`（消息时间，秒级 Unix 时间戳）
+- `sender` —— **稳定账号 id**（`message.new` 是发送者，`message.revoke` 是撤回者）。注意它**不一定是 `wxid_` 前缀**：老号是自定义 id（如 `lyp45ms`、`qq562959733`），不要用前缀做校验。拿不到时为 `null`（系统消息、自己发的消息），不会回落成某个名字。
+- `platformMessageId` —— **稳定消息 id**，与 `/api/v1/messages` 和 `/api/v1/sessions/:id/messages` 返回的 `platformMessageId` 同源，所以推送与拉取可以用它互相去重。
+
+  ⚠️ 撤回事件里，**只有原消息被真正定位到时才有值，否则为 `null`**。`rawid` 为了让人看懂会回落到「撤回前最近一条」的猜测甚至字符串 `未知`；那种回落放进给人看的文案无妨，但按猜出来的 id 去撤回一条消息，比不撤回更糟。**要处理撤回，判 `platformMessageId != null`，不要用 `rawid`。**
 
 ### 示例
 
@@ -98,14 +102,14 @@ curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=YOUR_TOKEN
 
 ```text
 event: message.new
-data: {"event":"message.new","sessionId":"xxx@chatroom","sessionType":"group","rawid":"1234567890123456789","avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"[图片]","timestamp":1760000123}
+data: {"event":"message.new","sessionId":"xxx@chatroom","sessionType":"group","rawid":"1234567890123456789","avatarUrl":"https://example.com/group.jpg","sourceName":"李四","groupName":"项目群","content":"[图片]","timestamp":1760000123,"sender":"wxid_abc123","platformMessageId":"1234567890123456789"}
 ```
 
 撤回事件示例：
 
 ```text
 event: message.revoke
-data: {"event":"message.revoke","sessionId":"wxid_xxx","sessionType":"other","rawid":"1234567890123456789","avatarUrl":"https://example.com/avatar.jpg","sourceName":"张三","content":"对方撤回了一条消息（rawid：1234567890123456789） 内容为“你好”","timestamp":1760000180}
+data: {"event":"message.revoke","sessionId":"wxid_xxx","sessionType":"other","rawid":"1234567890123456789","avatarUrl":"https://example.com/avatar.jpg","sourceName":"张三","content":"对方撤回了一条消息（rawid：1234567890123456789） 内容为“你好”","timestamp":1760000180,"sender":"wxid_xxx","platformMessageId":"1234567890123456789"}
 ```
 
 ---
