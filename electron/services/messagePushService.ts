@@ -6,6 +6,12 @@ import { promises as fs } from 'fs'
 import path from 'path'
 import { createHash } from 'crypto'
 import { pathToFileURL } from 'url'
+import {
+  extractRevokedPlatformMessageId,
+  findExactRevokedOriginal,
+  isRevokeSystemMessage,
+  messageIdTokens
+} from './wechatRevoke'
 
 interface SessionBaseline {
   lastTimestamp: number
@@ -52,9 +58,8 @@ interface MessagePushPayload {
    * 消息的稳定平台 id（`serverIdRaw`），与 HTTP 拉取接口返回的 `platformMessageId`
    * 是同一个值 —— 所以推送与拉取可以用它互相去重。
    *
-   * 撤回事件里，**只有当原消息被真正定位到时才给值**，否则为 `null`。`rawid` 会为了
-   * 让人看懂而回落到「最近一条」的猜测甚至字符串「未知」；那种猜测放进给人看的文案里
-   * 无妨，但绝不能进 id 字段 —— 按猜出来的 id 去撤回一条消息，比不撤回更糟。
+   * 撤回事件只接受撤回 XML 的原消息 id，或由它精确命中的原消息 `serverIdRaw`。
+   * 系统行自己的 id、相邻消息和显示用 `rawid` 永远不会进入这个字段。
    */
   platformMessageId: string | null
 }
@@ -788,12 +793,7 @@ class MessagePushService {
   }
 
   private isRevokeSystemMessage(message: Message): boolean {
-    const localType = Number(message.localType || 0)
-    const content = `${message.rawContent || ''}\n${message.parsedContent || ''}`
-    if (content.includes('revokemsg') || content.includes('<replacemsg')) return true
-    if (content.includes('撤回了一条消息') || content.includes('尝试撤回此消息')) return true
-    if ((localType === 10000 || localType === 10002) && content.includes('撤回')) return true
-    return false
+    return isRevokeSystemMessage(message)
   }
 
   private isRevokeSessionSummary(session: ChatSession): boolean {
@@ -848,52 +848,7 @@ class MessagePushService {
     revokeMessage: Message,
     revokedMessageId?: string
   ): Message | undefined {
-    if (revokedMessageId) {
-      const byPlatformId = this.findMessageByPlatformId(messages, revokedMessageId, revokeMessage)
-      if (byPlatformId) return byPlatformId
-    }
-    return this.findNearestMessageBeforeRevoke(messages, revokeMessage)
-  }
-
-  private findMessageByPlatformId(messages: Message[], revokedMessageId: string, revokeMessage: Message): Message | undefined {
-    const normalizedTarget = this.normalizeMessageIdToken(revokedMessageId)
-    if (!normalizedTarget) return undefined
-
-    for (const message of messages) {
-      if (message.messageKey === revokeMessage.messageKey) continue
-      if (this.isRevokeSystemMessage(message)) continue
-      if (this.getMessageIdTokens(message).has(normalizedTarget)) {
-        return message
-      }
-    }
-    return undefined
-  }
-
-  private findNearestMessageBeforeRevoke(messages: Message[], revokeMessage: Message): Message | undefined {
-    const revokeCreateTime = Number(revokeMessage.createTime || 0)
-    const revokeSortSeq = Number(revokeMessage.sortSeq || 0)
-    const revokeLocalId = Number(revokeMessage.localId || 0)
-
-    let best: Message | undefined
-    for (const message of messages) {
-      if (message.messageKey === revokeMessage.messageKey) continue
-      if (message.isSend === 1) continue
-      if (this.isRevokeSystemMessage(message)) continue
-
-      const createTime = Number(message.createTime || 0)
-      const sortSeq = Number(message.sortSeq || 0)
-      const localId = Number(message.localId || 0)
-      if (revokeCreateTime > 0 && createTime > revokeCreateTime) continue
-      if (revokeCreateTime > 0 && createTime === revokeCreateTime) {
-        if (revokeSortSeq > 0 && sortSeq > revokeSortSeq) continue
-        if (revokeSortSeq <= 0 && revokeLocalId > 0 && localId > revokeLocalId) continue
-      }
-
-      if (!best || this.compareMessagePosition(message, best) > 0) {
-        best = message
-      }
-    }
-    return best
+    return findExactRevokedOriginal(messages, revokeMessage, revokedMessageId)
   }
 
   private compareMessagePosition(left: Message, right: Message): number {
@@ -913,37 +868,11 @@ class MessagePushService {
   }
 
   private getMessageIdTokens(message: Message): Set<string> {
-    const tokens = new Set<string>()
-    const add = (value: unknown) => {
-      const normalized = this.normalizeMessageIdToken(value)
-      if (normalized) tokens.add(normalized)
-    }
-    add(message.serverIdRaw)
-    add(message.serverId)
-    add(message.localId)
-    const content = String(message.rawContent || '')
-    add(this.extractXmlValue(content, 'newmsgid'))
-    add(this.extractXmlValue(content, 'msgid'))
-    add(this.extractXmlValue(content, 'oldmsgid'))
-    add(this.extractXmlValue(content, 'svrid'))
-    return tokens
+    return messageIdTokens(message)
   }
 
   private extractRevokedMessageId(message: Message): string | undefined {
-    const content = String(message.rawContent || message.parsedContent || '')
-    const candidates = [
-      this.extractXmlValue(content, 'newmsgid'),
-      this.extractXmlValue(content, 'msgid'),
-      this.extractXmlValue(content, 'oldmsgid'),
-      this.extractXmlValue(content, 'svrid'),
-      message.serverIdRaw,
-      message.serverId
-    ]
-    for (const candidate of candidates) {
-      const normalized = this.normalizeMessageIdToken(candidate)
-      if (normalized) return normalized
-    }
-    return undefined
+    return extractRevokedPlatformMessageId(message)
   }
 
   private extractRevokerUsername(message: Message): string | undefined {
@@ -1051,14 +980,13 @@ class MessagePushService {
       : this.getRevokeFallbackContent(message)
     const safeContent = String(originalContent || '未知内容').trim() || '未知内容'
     const content = `对方撤回了一条消息（rawid：${rawid}） 内容为“${safeContent}”`
-    this.rememberRecentlyRevokedOriginalTokens(sessionId, originalMessage, revokedMessageId, message)
+    this.rememberRecentlyRevokedOriginalTokens(sessionId, originalMessage, revokedMessageId)
     const isGroup = sessionId.endsWith('@chatroom')
     const sessionType = this.getSessionType(sessionId, session)
     const createTime = Number(message.createTime || 0)
-    // `rawid` 为了让人看懂，会一路回落到 findNearestMessageBeforeRevoke 的**猜测**、
-    // 撤回系统行自己的 id、最后是字符串「未知」。那些回落对文案无害，但绝不能进 id
-    // 字段：只有 originalMessage 真的被定位到时，我们才知道被撤回的是哪一条。
-    const platformMessageId = originalMessage ? this.getPlatformMessageId(originalMessage) : null
+    // `rawid` can still fall back for display. The machine id is exact XML or
+    // an original row matched by that exact XML id — never a neighbour/system id.
+    const platformMessageId = (originalMessage ? this.getPlatformMessageId(originalMessage) : null) || revokedMessageId || null
 
     if (isGroup) {
       const groupInfo = await chatService.getContactAvatar(sessionId)
@@ -1117,8 +1045,7 @@ class MessagePushService {
   private rememberRecentlyRevokedOriginalTokens(
     sessionId: string,
     originalMessage?: Message,
-    revokedMessageId?: string,
-    revokeMessage?: Message
+    revokedMessageId?: string
   ): void {
     const keyPrefix = String(sessionId || '').trim()
     if (!keyPrefix) return
@@ -1135,8 +1062,6 @@ class MessagePushService {
       add(originalMessage.serverId)
     }
     add(revokedMessageId)
-    add(revokeMessage?.serverIdRaw)
-    add(revokeMessage?.serverId)
 
     const now = Date.now()
     for (const token of tokens) {

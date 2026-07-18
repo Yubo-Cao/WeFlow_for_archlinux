@@ -75,7 +75,7 @@ GET /api/v1/push/messages
 - 同时需要开启 `主动推送`
 - 响应类型为 `text/event-stream`
 - 事件名包含 `message.new` 和 `message.revoke`
-- 建议接收端按 `event + platformMessageId` 去重（`platformMessageId` 为 `null` 时回落到 `event + rawid`）
+- 建议接收端按 `event + platformMessageId` 去重；撤回的 `platformMessageId` 为 `null` 时必须放弃，不得回落到 `rawid`
 
 ### 事件字段
 
@@ -90,7 +90,7 @@ GET /api/v1/push/messages
 - `sender` —— **稳定账号 id**（`message.new` 是发送者，`message.revoke` 是撤回者）。注意它**不一定是 `wxid_` 前缀**：老号是自定义 id（如 `lyp45ms`、`qq562959733`），不要用前缀做校验。拿不到时为 `null`（系统消息、自己发的消息），不会回落成某个名字。
 - `platformMessageId` —— **稳定消息 id**，与 `/api/v1/messages` 和 `/api/v1/sessions/:id/messages` 返回的 `platformMessageId` 同源，所以推送与拉取可以用它互相去重。
 
-  ⚠️ 撤回事件里，**只有原消息被真正定位到时才有值，否则为 `null`**。`rawid` 为了让人看懂会回落到「撤回前最近一条」的猜测甚至字符串 `未知`；那种回落放进给人看的文案无妨，但按猜出来的 id 去撤回一条消息，比不撤回更糟。**要处理撤回，判 `platformMessageId != null`，不要用 `rawid`。**
+  ⚠️ 撤回事件里只会返回撤回 XML 明确给出的原消息 id，或由该 id 精确命中的原消息 `serverIdRaw`；系统行自己的 id、相邻消息和显示用 `rawid` 都不会进入此字段。结构化原 id 缺失时为 `null`。**要处理撤回，判 `platformMessageId != null`，不要用 `rawid`。**
 
 ### 示例
 
@@ -143,6 +143,7 @@ GET /api/v1/messages
 | `voice`   | string | 否   | 在 `media=1` 时控制语音导出，兼容别名 `vioce`         |
 | `video`   | string | 否   | 在 `media=1` 时控制视频导出                           |
 | `emoji`   | string | 否   | 在 `media=1` 时控制表情导出                           |
+| `file`    | string | 否   | 在 `media=1` 时控制文件附件导出                       |
 
 ### 示例
 
@@ -380,13 +381,14 @@ GET /api/v1/sessions/:id/messages
 
 ### 参数
 
-| 参数     | 类型   | 必填 | 说明                                     |
-| -------- | ------ | ---- | ---------------------------------------- |
-| `:id`    | string | 是   | 会话 ID（Path 参数）                     |
-| `since`  | number | 否   | 秒级 Unix 时间戳，仅返回此时间之后的消息 |
-| `end`    | number | 否   | 秒级 Unix 时间戳，时间上界               |
-| `limit`  | number | 否   | 单次返回上限，默认且最大 `5000`          |
-| `offset` | number | 否   | 分页偏移，默认 `0`                       |
+| 参数     | 类型   | 必填 | 说明                                                        |
+| -------- | ------ | ---- | ----------------------------------------------------------- |
+| `:id`    | string | 是   | 会话 ID（Path 参数）                                        |
+| `since`  | number | 否   | 秒级 Unix 时间戳，仅返回此时间之后的消息                    |
+| `end`    | number | 否   | 秒级 Unix 时间戳，时间上界                                  |
+| `limit`  | number | 否   | 单次返回上限，默认且最大 `5000`                             |
+| `offset` | number | 否   | 分页偏移，默认 `0`                                          |
+| `media`  | string | 否   | `1/true` 时导出媒体；可用 `image/voice/video/emoji/file` 窄化 |
 
 ### 响应
 
@@ -410,6 +412,7 @@ GET /api/v1/sessions/:id/messages
     {
       "platformId": "wxid_a",
       "accountName": "张三",
+      "event": "create",
       "groupNickname": "产品",
       "avatar": "https://example.com/avatar.jpg"
     }
@@ -432,6 +435,8 @@ GET /api/v1/sessions/:id/messages
   }
 }
 ```
+
+`messages[].event` 为 `create` 或 `retract`。`retract` 仅在结构化撤回 XML 给出原消息 id 时生成，其 `platformMessageId` 就是被撤回消息的 id、`type` 为 `81`、`content` 为 `null`；无法证明原 id 的系统行仍按普通系统消息返回。启用 `media=1` 后，图片、表情和文件还会返回 `mediaPath`、`mediaKind`（`image/sticker/file`）、`mediaFileName`、`mediaSha256` 与 `mediaBytes`。
 
 ### sync 块
 
@@ -711,7 +716,7 @@ DELETE /api/v1/sns/post/{postId}
 
 > 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
 
-通过消息接口启用 `media=1` 后，接口会先把图片、语音、视频、表情导出到本地缓存目录，再返回可访问的 HTTP 地址。
+通过消息接口启用 `media=1` 后，接口会先把图片、语音、视频、表情和文件导出到本地缓存目录。成功导出的字节随后复制到 `objects/{sha256}` 不可变对象路径；同一组字节始终得到同一个 URL，原文件名另由消息字段返回。单个对象上限为 64 MiB，超限或不完整导出不会返回媒体地址。
 
 **请求**
 
@@ -722,7 +727,7 @@ GET /api/v1/media/{relativePath}
 ### 示例
 
 ```bash
-curl "http://127.0.0.1:5031/api/v1/media/xxx@chatroom/images/abc123.jpg"
+curl -H "Authorization: Bearer YOUR_TOKEN" "http://127.0.0.1:5031/api/v1/media/objects/0123456789abcdef..."
 curl "http://127.0.0.1:5031/api/v1/media/xxx@chatroom/voices/voice_100.wav"
 curl "http://127.0.0.1:5031/api/v1/media/xxx@chatroom/videos/video_200.mp4"
 curl "http://127.0.0.1:5031/api/v1/media/xxx@chatroom/emojis/emoji_300.gif"
@@ -805,4 +810,4 @@ members = requests.get(
 2. 使用前需要先在 WeFlow 中完成数据库连接。
 3. `start` 和 `end` 支持 `YYYYMMDD` 与时间戳；纯 `YYYYMMDD` 的 `end` 会扩展到当天 `23:59:59`。
 4. 群成员的 `groupNickname` 依赖微信源数据；源数据缺失时不会自动补出。
-5. 媒体访问链接只有在对应消息已经通过 `media=1` 导出后才可访问。
+5. 媒体访问链接只有在对应消息已经通过 `media=1` 导出后才可访问，并且与其他 API 一样要求有效 Token；清理 WeFlow 缓存会删除对象，调用方应在拿到地址后及时下载并自行持久化。

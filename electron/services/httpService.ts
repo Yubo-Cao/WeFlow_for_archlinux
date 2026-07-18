@@ -6,7 +6,7 @@ import * as http from 'http'
 import * as fs from 'fs'
 import * as path from 'path'
 import { URL } from 'url'
-import { timingSafeEqual } from 'crypto'
+import { createHash, randomUUID, timingSafeEqual } from 'crypto'
 import { chatService, Message } from './chatService'
 import { wcdbService } from './wcdbService'
 import { ConfigService } from './config'
@@ -17,6 +17,13 @@ import { snsService } from './snsService'
 import * as os from 'os'
 import { ApiMessageMapperPool } from './apiMessageMapperPool'
 import { mapRowsToMessagesLite } from './apiMessageMapping'
+import { exportService } from './export'
+import {
+  extractRevokedPlatformMessageId,
+  extractRevokerUsername,
+  findExactRevokedOriginal,
+  isRevokeSystemMessage
+} from './wechatRevoke'
 
 // ChatLab 格式定义
 interface ChatLabHeader {
@@ -44,6 +51,7 @@ interface ChatLabMember {
 }
 
 interface ChatLabMessage {
+  event?: 'create' | 'retract'
   sender: string
   accountName: string
   groupNickname?: string
@@ -53,6 +61,10 @@ interface ChatLabMessage {
   platformMessageId?: string
   replyToMessageId?: string
   mediaPath?: string
+  mediaKind?: 'image' | 'sticker' | 'file'
+  mediaFileName?: string
+  mediaSha256?: string
+  mediaBytes?: number
 }
 
 interface ApiQuoteSnapshot {
@@ -82,9 +94,10 @@ interface ApiMediaOptions {
   exportVoices: boolean
   exportVideos: boolean
   exportEmojis: boolean
+  exportFiles: boolean
 }
 
-type MediaKind = 'image' | 'voice' | 'video' | 'emoji'
+type MediaKind = 'image' | 'voice' | 'video' | 'emoji' | 'file'
 type ApiSessionType = 'group' | 'private' | 'channel' | 'other'
 
 interface ApiExportedMedia {
@@ -92,7 +105,11 @@ interface ApiExportedMedia {
   fileName: string
   fullPath: string
   relativePath: string
+  sha256?: string
+  bytes?: number
 }
+
+const API_MEDIA_MAX_BYTES = 64 * 1024 * 1024
 
 interface MessagePushReplayEvent {
   id: number
@@ -600,6 +617,8 @@ class HttpService {
       const stat = fs.statSync(fullPath)
       res.setHeader('Content-Type', contentType)
       res.setHeader('Content-Length', stat.size)
+      res.setHeader('Cache-Control', relativePath.startsWith('objects/') ? 'private, max-age=31536000, immutable' : 'private, no-store')
+      res.setHeader('X-Content-Type-Options', 'nosniff')
       res.writeHead(200)
 
       const stream = fs.createReadStream(fullPath)
@@ -1016,7 +1035,8 @@ class HttpService {
         exportImages: false,
         exportVoices: false,
         exportVideos: false,
-        exportEmojis: false
+        exportEmojis: false,
+        exportFiles: false
       }
     }
 
@@ -1025,7 +1045,8 @@ class HttpService {
       exportImages: this.parseBooleanParam(url, ['image', 'tupian'], true),
       exportVoices: this.parseBooleanParam(url, ['voice', 'vioce'], true),
       exportVideos: this.parseBooleanParam(url, ['video'], true),
-      exportEmojis: this.parseBooleanParam(url, ['emoji'], true)
+      exportEmojis: this.parseBooleanParam(url, ['emoji'], true),
+      exportFiles: this.parseBooleanParam(url, ['file'], true)
     }
   }
 
@@ -1219,13 +1240,15 @@ class HttpService {
     const offset = this.parseIntParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER)
     const sinceParam = url.searchParams.get('since')
     const endParam = url.searchParams.get('end')
+    const mediaOptions = this.parseMediaOptions(url)
 
     const startTime = sinceParam ? this.parseTimeParam(sinceParam) : 0
     const endTime = endParam ? this.parseTimeParam(endParam, true) : 0
 
     try {
-      // ChatLab Pull 始终非媒体、lite 映射：走线程池并行映射（limit 可达 5000，提速更明显）
-      const result = await this.fetchApiMessagesParallel(sessionId, offset, limit, startTime, endTime, true)
+      const result = mediaOptions.enabled
+        ? await this.fetchMessagesBatch(sessionId, offset, limit, startTime, endTime, false, false)
+        : await this.fetchApiMessagesParallel(sessionId, offset, limit, startTime, endTime, true)
       if (!result.success || !result.messages) {
         this.sendError(res, 500, result.error || 'Failed to get messages')
         return
@@ -1233,10 +1256,13 @@ class HttpService {
 
       const messages = result.messages
       const hasMore = result.hasMore === true
+      const mediaMap = mediaOptions.enabled
+        ? await this.exportMediaForMessages(messages, sessionId, mediaOptions)
+        : new Map<number, ApiExportedMedia>()
 
       const displayNames = await this.getDisplayNames([sessionId])
       const talkerName = displayNames[sessionId] || sessionId
-      const chatLabData = await this.convertToChatLab(messages, sessionId, talkerName)
+      const chatLabData = await this.convertToChatLab(messages, sessionId, talkerName, mediaMap)
 
       const lastTimestamp = messages.length > 0
         ? messages[messages.length - 1].createTime
@@ -1244,6 +1270,10 @@ class HttpService {
 
       this.sendJson(res, {
         ...chatLabData,
+        media: {
+          enabled: mediaOptions.enabled,
+          count: mediaMap.size
+        },
         sync: {
           hasMore,
           nextSince: hasMore && lastTimestamp ? lastTimestamp : undefined,
@@ -1734,7 +1764,8 @@ class HttpService {
     for (const msg of messages) {
       const exported = await this.exportMediaForMessage(msg, talker, sessionDir, options)
       if (exported) {
-        mediaMap.set(msg.localId, exported)
+        const stable = this.stabilizeApiMedia(exported)
+        if (stable) mediaMap.set(msg.localId, stable)
       }
     }
 
@@ -1864,11 +1895,62 @@ class HttpService {
           return { kind: 'emoji', fileName, fullPath, relativePath }
         }
       }
+
+      if (options.exportFiles && msg.localType === 49 && this.resolveType49Subtype(msg) === '6') {
+        const session = this.sanitizeFileName(talker, 'session')
+        const exported = await exportService.context.exportMediaForMessage(
+          msg,
+          talker,
+          this.getApiMediaExportPath(),
+          session,
+          { exportFiles: true, maxFileSizeMb: 64 }
+        )
+        if (exported?.kind === 'file') {
+          const fullPath = path.resolve(this.getApiMediaExportPath(), exported.relativePath)
+          const mediaRoot = path.resolve(this.getApiMediaExportPath())
+          if (fullPath.startsWith(mediaRoot + path.sep) && fs.existsSync(fullPath)) {
+            return {
+              kind: 'file',
+              fileName: this.sanitizeFileName(msg.fileName || path.basename(fullPath), `file_${msg.localId}`),
+              fullPath,
+              relativePath: exported.relativePath
+            }
+          }
+        }
+      }
     } catch (e) {
       console.warn('[HttpService] exportMediaForMessage failed:', e)
     }
 
     return null
+  }
+
+  /** Copy successful exports to an immutable object path keyed only by bytes. */
+  private stabilizeApiMedia(media: ApiExportedMedia): ApiExportedMedia | null {
+    try {
+      const stat = fs.statSync(media.fullPath)
+      if (!stat.isFile() || stat.size <= 0 || stat.size > API_MEDIA_MAX_BYTES) return null
+      const bytes = fs.readFileSync(media.fullPath)
+      const sha256 = createHash('sha256').update(bytes).digest('hex')
+      const relativePath = `objects/${sha256}`
+      const fullPath = path.join(this.getApiMediaExportPath(), relativePath)
+      this.ensureDir(path.dirname(fullPath))
+      const complete = fs.existsSync(fullPath)
+        && createHash('sha256').update(fs.readFileSync(fullPath)).digest('hex') === sha256
+      if (!complete) {
+        const temporary = `${fullPath}.${randomUUID()}.tmp`
+        try {
+          fs.writeFileSync(temporary, bytes)
+          fs.renameSync(temporary, fullPath)
+        } finally {
+          if (fs.existsSync(temporary)) fs.unlinkSync(temporary)
+        }
+      }
+      return { ...media, fullPath, relativePath, sha256, bytes: bytes.length }
+    } catch (error) {
+      console.warn('[HttpService] stabilizeApiMedia failed:', error)
+      return null
+    }
   }
 
   private toApiMessage(msg: Message, media?: ApiExportedMedia): Record<string, any> {
@@ -2190,18 +2272,33 @@ class HttpService {
       let sliceStart = Date.now()
       for (let i = 0; i < messages.length; i++) {
         const msg = messages[i]
-        const senderInfo = this.resolveChatLabSenderInfo(msg, talkerId, talkerName, myWxid, isGroup, senderNames, groupNicknamesMap)
+        const revokedId = isRevokeSystemMessage(msg) ? extractRevokedPlatformMessageId(msg) : undefined
+        const original = revokedId ? findExactRevokedOriginal(messages, msg, revokedId) : undefined
+        const revoker = revokedId ? extractRevokerUsername(msg) : undefined
+        const identityMessage = original || (revoker ? { ...msg, senderUsername: revoker } : msg)
+        const senderInfo = this.resolveChatLabSenderInfo(identityMessage, talkerId, talkerName, myWxid, isGroup, senderNames, groupNicknamesMap)
         const quoteInfo = this.extractApiQuoteInfo(msg)
+        const media = mediaMap.get(msg.localId)
+        const captureMediaKind = media?.kind === 'emoji'
+          ? 'sticker'
+          : media?.kind === 'image' || media?.kind === 'file'
+            ? media.kind
+            : undefined
 
         const chatLabMessage: ChatLabMessage = {
+          event: revokedId ? 'retract' : 'create',
           sender: senderInfo.sender,
           accountName: senderInfo.accountName,
           groupNickname: senderInfo.groupNickname,
           timestamp: msg.createTime,
-          type: this.mapMessageType(msg.localType, msg),
-          content: this.getMessageContent(msg, quoteInfo),
-          platformMessageId: this.getMessageServerId(msg) || undefined,
-          mediaPath: mediaMap.get(msg.localId) ? `http://${this.host}:${this.port}/api/v1/media/${mediaMap.get(msg.localId)!.relativePath}` : undefined
+          type: revokedId ? ChatLabType.RECALL : this.mapMessageType(msg.localType, msg),
+          content: revokedId ? null : this.getMessageContent(msg, quoteInfo),
+          platformMessageId: revokedId || this.getMessageServerId(msg) || undefined,
+          mediaPath: captureMediaKind && media ? `http://${this.host}:${this.port}/api/v1/media/${media.relativePath}` : undefined,
+          mediaKind: captureMediaKind,
+          mediaFileName: captureMediaKind ? media?.fileName : undefined,
+          mediaSha256: captureMediaKind ? media?.sha256 : undefined,
+          mediaBytes: captureMediaKind ? media?.bytes : undefined
         }
         if (quoteInfo?.replyToMessageId) {
           chatLabMessage.replyToMessageId = quoteInfo.replyToMessageId
